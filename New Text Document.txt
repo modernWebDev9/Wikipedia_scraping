@@ -1,0 +1,517 @@
+"""
+Military Medals Excel Builder
+- Medal list: extracted from client-provided Wikipedia overview pages
+- Ribbon image: found by parsing the medal page's infobox via Wikipedia API
+"""
+
+import os
+import re
+import time
+import requests
+from io import BytesIO
+from bs4 import BeautifulSoup
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as ExcelImage
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles.borders import Border, Side
+from openpyxl.utils import get_column_letter
+from PIL import Image as PILImage
+
+# ── Config ────────────────────────────────────────────────────────────────────
+API     = "https://en.wikipedia.org/w/api.php"
+HEADERS = {"User-Agent": "MedalCatalogBot/1.0 (educational project)"}
+
+IMAGE_DIR     = "ribbons"
+EXCEL_FILE    = "medals_preview_40.xlsx"
+LIMIT         = 8       # rows per country in final output → 5 × 8 = 40
+FETCH         = 40      # candidates to scan per country (pick best 8 with ribbons)
+DELAY         = 1.5
+
+ROW_HEIGHT_PT = 22.5
+COL_IMG_WIDTH = 15.0
+IMG_W, IMG_H  = 110, 28
+
+os.makedirs(IMAGE_DIR, exist_ok=True)
+
+# ── Client-provided country pages + category fallbacks ───────────────────────
+COUNTRIES = {
+    "US": {
+        "page":     "Awards and decorations of the United States Armed Forces",
+        "category": "Category:Military awards and decorations of the United States",
+        "use_category": False,
+    },
+    "CA": {
+        "page":     "Orders, decorations, and medals of Canada",
+        "category": "Category:Military awards and decorations of Canada",
+        "use_category": True,
+    },
+    "NZ": {
+        "page":     "New Zealand honours order of wearing",
+        "category": "Category:Military awards and decorations of New Zealand",
+        "use_category": True,
+    },
+    "AU": {
+        "page":     "Australian honours and awards system",
+        "category": "Category:Military awards and decorations of Australia",
+        "use_category": True,
+    },
+    "IN": {
+        "page":     "Orders, decorations, and medals of India",
+        "category": "Category:Military awards and decorations of India",
+        "use_category": True,
+    },
+}
+
+TOP_MEDAL = {
+    "US": "medal of honor",
+    "CA": "victoria cross",
+    "NZ": "victoria cross",
+    "AU": "victoria cross",
+    "IN": "param vir chakra",
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def api_get(params: dict) -> dict:
+    params.setdefault("format", "json")
+    params.setdefault("formatversion", "2")
+    for attempt in range(3):
+        try:
+            r = requests.get(API, params=params, headers=HEADERS, timeout=20)
+            if r.status_code == 429:
+                time.sleep(4 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            print(f"  [API WARN] {e}")
+            time.sleep(2)
+    return {}
+
+
+def get_medal_links(page_title: str, limit: int) -> list[tuple[str, str]]:
+    """Pull medal links from the client-provided overview page via prop=links."""
+    params = {
+        "action":      "query",
+        "titles":      page_title,
+        "prop":        "links",
+        "pllimit":     "500",
+        "plnamespace": "0",
+    }
+    data  = api_get(params)
+    pages = data.get("query", {}).get("pages", [])
+    if not pages:
+        return []
+
+    # Skip pages that are clearly not individual medal articles
+    skip_re = re.compile(
+        r"^(List of|History of|Armed forces of|Military of|"
+        r"Comparison|Wikipedia:|File:|Template:|Category:|"
+        r"\d{4}\s|Honours system|honours system|awards system|"
+        r"order of wearing|order of precedence)",
+        re.I,
+    )
+
+    results = []
+    for lnk in pages[0].get("links", []):
+        title = lnk.get("title", "")
+        if skip_re.match(title) or len(title) < 5:
+            continue
+        url = "https://en.wikipedia.org/wiki/" + title.replace(" ", "_")
+        results.append((title, url))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def get_category_members(category: str, limit: int) -> list[tuple[str, str]]:
+    """Pull medal articles directly from a Wikipedia category."""
+    params = {
+        "action":      "query",
+        "list":        "categorymembers",
+        "cmtitle":     category,
+        "cmtype":      "page",
+        "cmlimit":     str(limit * 6),        "cmnamespace": "0",
+    }
+    data    = api_get(params)
+    members = data.get("query", {}).get("categorymembers", [])
+
+    # Skip non-medal articles
+    skip_re = re.compile(
+        r"^(List of|History of|Overview|System|Honours system)|"
+        r"\bBadge\b|\bInsignia\b|\bUnit\b|\bSquadron\b|\bBattery\b|\bBattalion\b",
+        re.I,
+    )
+    results = []
+    for m in members:
+        title = m.get("title", "")
+        if skip_re.search(title) or len(title) < 5:
+            continue
+        url = "https://en.wikipedia.org/wiki/" + title.replace(" ", "_")
+        results.append((title, url))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def get_ribbon_from_infobox(medal_title: str) -> tuple[str, str]:
+    """
+    Scan the Wikipedia page top-to-bottom and return the FIRST image that
+    is a ribbon bar. Accepts images that:
+      - Have 'ribbon' or '_bar' in the filename, OR are ribbon-shaped (width/height >= 2.5)
+      - Are inside the infobox OR inside a <figure> whose <figcaption> contains 'ribbon'
+      - Are NOT in a Next/Higher/Lower row
+      - Are NOT a JPEG photo, flag, coat of arms, logo, etc.
+    """
+    params = {
+        "action":             "parse",
+        "page":               medal_title,
+        "prop":               "text",
+        "disableeditsection": "true",
+        "disabletoc":         "true",
+    }
+    data = api_get(params)
+    html = data.get("parse", {}).get("text", "")
+    if not html:
+        return _pageimage_fallback(medal_title)
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    ribbon_fname_re   = re.compile(r"ribbon|_bar\b|ribbon.bar|service.bar", re.I)
+    skip_fname_re     = re.compile(
+        r"flag|coat.of.arms|logo|icon|map|seal|portrait|"
+        r"wiki_letter|ambox|question_mark|voting|emblem|"
+        r"insignia|crest|shield|star\.svg",
+        re.I,
+    )
+    next_row_re       = re.compile(r"next|higher|lower|preceded|followed|successor|predecessor", re.I)
+    ribbon_caption_re = re.compile(r"\bribbon\b", re.I)
+    infobox           = soup.find("table", class_=re.compile(r"infobox", re.I))
+
+    def real_filename(src: str) -> str:
+        m = re.search(r"/thumb/[0-9a-f]/[0-9a-f]{2}/([^/]+\.(svg|png|jpg|jpeg|gif))/", src, re.I)
+        return requests.utils.unquote(m.group(1) if m else src.split("/")[-1])
+
+    def is_bad(fname: str) -> bool:
+        return bool(skip_fname_re.search(fname) or re.search(r"\.(jpg|jpeg)$", fname, re.I))
+
+    def ribbon_shape(img_tag) -> bool:
+        try:
+            fw = int(img_tag.get("data-file-width",  0))
+            fh = int(img_tag.get("data-file-height", 0))
+            return fw > 0 and fh > 0 and fw / fh >= 2.5
+        except (ValueError, TypeError):
+            return False
+
+    for img in soup.find_all("img"):
+        src = img.get("src", "")
+        if not src:
+            continue
+        fname = real_filename(src)
+        if is_bad(fname):
+            continue
+
+        has_ribbon_kw = bool(ribbon_fname_re.search(fname))
+        is_ribbon     = has_ribbon_kw or ribbon_shape(img)
+        if not is_ribbon:
+            continue
+
+        # Must be in infobox or in a figure with ribbon caption
+        in_infobox = bool(infobox and img.find_parent("table", class_=re.compile(r"infobox", re.I)))
+        figure     = img.find_parent("figure")
+        in_ribbon_figure = (
+            figure is not None and
+            figure.find("figcaption") is not None and
+            ribbon_caption_re.search(figure.find("figcaption").get_text(strip=True))
+        )
+        if not in_infobox and not in_ribbon_figure:
+            continue
+
+        # Skip Next/Higher/Lower rows
+        tr = img.find_parent("tr")
+        if tr:
+            label = tr.find(class_=re.compile(r"infobox-label", re.I))
+            if label and next_row_re.search(label.get_text(strip=True)):
+                continue
+
+        # Skip the primary medal photo: in infobox-image cell, no ribbon keyword, not ribbon-shaped
+        if in_infobox and not has_ribbon_kw and not ribbon_shape(img):
+            continue
+
+        # ── Resolve URL ───────────────────────────────────────────────────────
+        if src.startswith("//"):
+            img_url = "https:" + src
+        elif src.startswith("http"):
+            img_url = src
+        else:
+            img_url = "https://en.wikipedia.org" + src
+
+        file_title = "File:" + fname
+        time.sleep(DELAY)
+        info_data  = api_get({
+            "action": "query", "titles": file_title,
+            "prop": "imageinfo", "iiprop": "url|mime|descriptionurl",
+            "iiurlwidth": "320",
+        })
+        info_pages = info_data.get("query", {}).get("pages", [])
+        ribbon_page = ""
+        if info_pages:
+            info        = info_pages[0].get("imageinfo", [{}])[0]
+            ribbon_page = info.get("descriptionurl", "")
+            if not ribbon_page:
+                canon       = info_pages[0].get("title", file_title)
+                ribbon_page = "https://commons.wikimedia.org/wiki/" + canon.replace(" ", "_")
+            thumb = info.get("thumburl", "")
+            if thumb:
+                img_url = thumb
+
+        return img_url, ribbon_page
+
+    return _pageimage_fallback(medal_title)
+
+
+def _pageimage_fallback(medal_title: str) -> tuple[str, str]:
+    """Last resort: use Wikipedia's own chosen thumbnail — only if it looks like a ribbon."""
+    params = {
+        "action":    "query",
+        "titles":    medal_title,
+        "prop":      "images",
+        "imlimit":   "50",
+    }
+    data  = api_get(params)
+    pages = data.get("query", {}).get("pages", [])
+    if not pages:
+        return "", ""
+
+    ribbon_re  = re.compile(r"ribbon|_bar\b|ribbon.bar|service.bar", re.I)
+    skip_re    = re.compile(r"\.(jpg|jpeg)$|flag|portrait|photo|emblem|logo|icon|seal|coat", re.I)
+    title_words = set(re.findall(r"[a-z]{3,}", medal_title.lower()))
+
+    best_file  = None
+    best_score = 0
+    for img in pages[0].get("images", []):
+        ftitle = img.get("title", "")
+        fname  = requests.utils.unquote(ftitle.replace("File:", ""))
+        if skip_re.search(fname):
+            continue
+        if not ribbon_re.search(fname):
+            continue
+        fname_words = set(re.findall(r"[a-z]{3,}", fname.lower()))
+        overlap = len(title_words & fname_words)
+        score   = 3 + overlap * 2
+        if score > best_score:
+            best_score = score
+            best_file  = ftitle
+
+    if not best_file:
+        return "", ""
+
+    file_title = best_file
+    time.sleep(DELAY)
+    info_params = {
+        "action":    "query",
+        "titles":    file_title,
+        "prop":      "imageinfo",
+        "iiprop":    "url|mime|canonicaltitle|descriptionurl",
+        "iiurlwidth": "320",
+    }
+    info_data  = api_get(info_params)
+    info_pages = info_data.get("query", {}).get("pages", [])
+    if not info_pages:
+        return "", ""
+    info     = info_pages[0].get("imageinfo", [{}])[0]
+    thumb    = info.get("thumburl", "")
+    original = info.get("url", "")
+    mime     = info.get("mime", "")
+    page_url = info.get("descriptionurl", "")
+    if not page_url:
+        canon    = info_pages[0].get("title", file_title)
+        page_url = "https://commons.wikimedia.org/wiki/" + canon.replace(" ", "_")
+
+    if thumb:
+        return thumb, page_url
+    if mime in ("image/png", "image/gif"):
+        return original, page_url
+    return "", page_url
+
+
+def download_image(url: str, filename: str) -> str | None:
+    filename = re.sub(r'[\\/*?:"<>|,\(\) ]', "_", filename)
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+    path = os.path.join(IMAGE_DIR, filename)
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            if r.status_code == 429:
+                wait = 6 * (attempt + 1)
+                print(f"    [429] waiting {wait}s…")
+                time.sleep(wait)
+                continue
+            if r.status_code != 200:
+                print(f"    [WARN] HTTP {r.status_code}")
+                return None
+            pil = PILImage.open(BytesIO(r.content)).convert("RGBA")
+            pil.thumbnail((IMG_W * 4, IMG_H * 4), PILImage.LANCZOS)
+            pil.save(path, "PNG", optimize=True)
+            return path
+        except Exception as e:
+            print(f"    [WARN] {e}")
+            return None
+    return None
+
+
+def safe_name(text: str) -> str:
+    return re.sub(r'[\\/*?:"<>|,\(\) ]', "_", text)[:80]
+
+
+# ── Collect medals ────────────────────────────────────────────────────────────
+all_medals = []
+
+for code, info in COUNTRIES.items():
+    seed_title = info["page"]
+    category   = info["category"]
+    use_cat    = info["use_category"]
+    print(f"\n{'='*45}\n  {code} — {seed_title}\n{'='*45}")
+    time.sleep(DELAY)
+
+    if use_cat:
+        medals = get_category_members(category, limit=FETCH)
+    else:
+        medals = get_medal_links(seed_title, limit=FETCH)
+        if not medals:
+            print(f"  → page links empty, trying category…")
+            time.sleep(DELAY)
+            medals = get_category_members(category, limit=FETCH)
+
+    if not medals:
+        print(f"  [WARN] no medals found")
+        continue
+
+    country_medals = []
+    for idx, (name, wiki_url) in enumerate(medals, start=1):
+        if len(country_medals) >= LIMIT:
+            break
+        print(f"  [{idx}] {name}")
+        time.sleep(DELAY)
+
+        img_url, ribbon_page = get_ribbon_from_infobox(name)
+        img_path = None
+
+        if img_url:
+            fname    = safe_name(f"{code}_{name}") + ".png"
+            img_path = download_image(img_url, fname)
+            status   = "✔" if img_path else "✘ download failed"
+            print(f"       {status}  {img_url[:90]}")
+        else:
+            print(f"       ✘ no ribbon — skipping")
+            continue   # skip this medal, try next candidate
+
+        top      = TOP_MEDAL.get(code, "")
+        priority = 1 if top in name.lower() else len(country_medals) + 1
+
+        country_medals.append({
+            "priority":    priority,
+            "country":     code,
+            "name":        name,
+            "wiki_url":    wiki_url,
+            "ribbon_page": ribbon_page,
+            "img_path":    img_path,
+        })
+
+    # If we couldn't fill all 4 slots with ribbons, include the rest without images
+    if len(country_medals) < LIMIT:
+        for idx, (name, wiki_url) in enumerate(medals, start=1):
+            if len(country_medals) >= LIMIT:
+                break
+            if any(m["name"] == name for m in country_medals):
+                continue
+            top      = TOP_MEDAL.get(code, "")
+            priority = 1 if top in name.lower() else len(country_medals) + 1
+            country_medals.append({
+                "priority":    priority,
+                "country":     code,
+                "name":        name,
+                "wiki_url":    wiki_url,
+                "ribbon_page": "",
+                "img_path":    None,
+            })
+
+    all_medals.extend(country_medals)
+
+print(f"\nTotal medals collected: {len(all_medals)}")
+
+
+# ── Build Excel ───────────────────────────────────────────────────────────────
+wb = Workbook()
+ws = wb.active
+ws.title = "Military Medals"
+
+HDR_FILL   = PatternFill("solid", fgColor="1F3864")
+HDR_FONT   = Font(bold=True, color="FFFFFF", size=11, name="Calibri")
+LINK_FONT  = Font(color="0563C1", underline="single", size=10, name="Calibri")
+BODY_FONT  = Font(size=10, name="Calibri")
+EVEN_FILL  = PatternFill("solid", fgColor="F0F4FF")
+ODD_FILL   = PatternFill("solid", fgColor="FFFFFF")
+CENTER     = Alignment(horizontal="center", vertical="center")
+LEFT_MID   = Alignment(horizontal="left",   vertical="center")
+HDR_BORDER = Border(bottom=Side(style="medium", color="AAAAAA"))
+
+COLS = [
+    ("Priority",         8),
+    ("Country",          9),
+    ("Medal Name",       35),
+    ("Wikipedia Link",   60),
+    ("Ribbon Page Link", 60),
+    ("Ribbon",           COL_IMG_WIDTH),
+]
+
+for ci, (label, width) in enumerate(COLS, 1):
+    c = ws.cell(row=1, column=ci, value=label)
+    c.fill      = HDR_FILL
+    c.font      = HDR_FONT
+    c.alignment = CENTER
+    c.border    = HDR_BORDER
+    ws.column_dimensions[get_column_letter(ci)].width = width
+ws.row_dimensions[1].height = 24
+
+for ri, m in enumerate(all_medals, start=2):
+    ws.row_dimensions[ri].height = ROW_HEIGHT_PT
+    fill = EVEN_FILL if ri % 2 == 0 else ODD_FILL
+
+    def cell(col, value, font=None, hyperlink=None, align=LEFT_MID):
+        c = ws.cell(ri, col, value)
+        c.fill = fill
+        c.font = font or BODY_FONT
+        c.alignment = align
+        if hyperlink:
+            c.hyperlink = hyperlink
+        return c
+
+    cell(1, m["priority"], align=CENTER)
+    cell(2, m["country"],  align=CENTER)
+    cell(3, m["name"])
+    cell(4, m["wiki_url"],    font=LINK_FONT, hyperlink=m["wiki_url"])
+
+    if m["ribbon_page"]:
+        cell(5, m["ribbon_page"], font=LINK_FONT, hyperlink=m["ribbon_page"])
+    else:
+        cell(5, "N/A")
+
+    if m["img_path"] and os.path.exists(m["img_path"]):
+        try:
+            img        = ExcelImage(m["img_path"])
+            img.width  = IMG_W
+            img.height = IMG_H
+            ws.add_image(img, f"F{ri}")
+        except Exception as e:
+            print(f"  [WARN] embed failed: {e}")
+            cell(6, "[embed error]")
+    else:
+        cell(6, "[no image]")
+
+ws.freeze_panes = "A2"
+ws.auto_filter.ref = f"A1:{get_column_letter(len(COLS))}1"
+
+wb.save(EXCEL_FILE)
+print(f"\n✔  Excel  →  {EXCEL_FILE}")
+print(f"✔  Ribbons →  {IMAGE_DIR}/")
